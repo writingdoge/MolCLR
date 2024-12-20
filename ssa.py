@@ -40,10 +40,15 @@ def compute_source_statistics(source_loader, model, device, K):
     mu_s = np.mean(features, axis=0)
     centered_features = features - mu_s
     Sigma_s = np.cov(centered_features, rowvar=False)
+    
+    print("协方差矩阵shape",Sigma_s.shape)  #(256, 256)
 
     # 特征值分解
     eigvals, eigvecs = np.linalg.eigh(Sigma_s)
     sorted_indices = np.argsort(eigvals)[::-1]
+    with open("cormatrix.txt",'w') as f:
+        print( eigvals[sorted_indices],file=f)
+    # print( eigvals[sorted_indices])
     eigvals = eigvals[sorted_indices][:K] # lambdas
     eigvecs = eigvecs[:, sorted_indices][:, :K]
     V_s = eigvecs.T

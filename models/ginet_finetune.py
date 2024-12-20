@@ -184,5 +184,10 @@ class GINet(nn.Module):
         h = self.pool(h, data.batch)
         h = self.feat_lin(h)
         
+        for i in range(4):# 0-3
+            h = self.pred_head[i](h)
+        
+        # print("feature shape",h.shape) [32,256]
+        
         return h
             

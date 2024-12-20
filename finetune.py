@@ -5,6 +5,7 @@ import yaml
 import numpy as np
 import pandas as pd
 from datetime import datetime
+import csv
 
 import torch
 from torch import nn
@@ -17,6 +18,10 @@ from dataset.dataset_test import MolTestDatasetWrapper
 
 
 from ssa import *
+
+
+basemodel = "ssa-gin-50.pt"
+ssa_K = 20
 
 
 apex_support = False
@@ -90,6 +95,8 @@ class FineTune(object):
     def _step(self, model, data, n_iter):
         # get the prediction
         __, pred = model(data)  # [N,C]
+              
+        # print("pred: ",pred.shape)
 
         if self.config['dataset']['task'] == 'classification':
             loss = self.criterion(pred, data.y.flatten())
@@ -122,6 +129,8 @@ class FineTune(object):
             from models.gcn_finetune import GCN
             model = GCN(self.config['dataset']['task'], **self.config["model"]).to(self.device)
             model = self._load_pre_trained_weights(model)
+        
+        print( model.pred_head)
 
         layer_list = []
         for name, param in model.named_parameters():
@@ -156,10 +165,10 @@ class FineTune(object):
         for epoch_counter in range(self.config['epochs']):
             for bn, data in enumerate(train_loader):
                 optimizer.zero_grad()
-
+                
                 data = data.to(self.device)
                 loss = self._step(model, data, n_iter)
-
+                            
                 if n_iter % self.config['log_every_n_steps'] == 0:
                     self.writer.add_scalar('train_loss', loss, global_step=n_iter)
                     print(epoch_counter, bn, loss.item())
@@ -191,14 +200,15 @@ class FineTune(object):
                 self.writer.add_scalar('validation_loss', valid_loss, global_step=valid_n_iter)
                 valid_n_iter += 1
                 
-        mu_s, V_s, lambdas = compute_source_statistics(train_loader,model,self.device,3)
+        # torch.save(model.state_dict(),basemodel)
+        # self._test(model,test_loader)
+        # torch.load(model,basemodel)
+                
+        mu_s, V_s, lambdas = compute_source_statistics(train_loader,model,self.device,ssa_K)
         
-        # 2. 获取线性回归器权重 w
-        w = model.pred_head[0].weight.detach().cpu().numpy()  # 提取预测头第一层的权重
-        # 3. 计算加权因子 weights
-        weights = 1 + np.abs(np.dot(w, V_s.T))  # 计算投影并加权
+        w = model.pred_head[4].weight.detach().cpu().numpy()  # 提取预测头最后一层的权重
+        weights = 1 + np.abs(np.dot(w, V_s.T))  # 投影并加权
         
-        # self._test(model, test_loader)
         self._test_with_ssa(model,test_loader,mu_s,V_s,lambdas,weights)
 
     def _load_pre_trained_weights(self, model):
@@ -321,19 +331,17 @@ class FineTune(object):
             labels = np.array(labels)
             self.roc_auc = roc_auc_score(labels, predictions[:,1])
             print('Test loss:', test_loss, 'Test ROC AUC:', self.roc_auc)
-    
-    def _test_with_ssa(self, model, test_loader, mu_s, V_s, lambdas, weights):        
+            
+        
+    def _test_with_ssa(self, model, test_loader, mu_s, V_s, lambdas, weights):      
         
         mu_s = torch.tensor(mu_s, device=self.device,dtype=torch.float32)
-        
         V_s = torch.tensor(V_s, device=self.device,dtype=torch.float32)
-        
         lambdas = torch.tensor(lambdas, device=self.device,dtype=torch.float32)
-        
         weights = torch.tensor(weights, device=self.device,dtype=torch.float32)
         
-        
         # 加载最佳模型权重
+        # model_path = basemodel
         model_path = os.path.join(self.writer.log_dir, 'checkpoints', 'model.pth')
         state_dict = torch.load(model_path, map_location=self.device)
         model.load_state_dict(state_dict)
@@ -348,14 +356,15 @@ class FineTune(object):
         optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-3)
 
         # SSA 阶段：适配目标域
-        model.train()  # 切换到训练模式
-        #################################epoch############
+        model.train()  
+        ########################epoch############
         for epoch in range(50):  # 多轮轻量训练
             for data in test_loader:
+                optimizer.zero_grad()
+                
                 data = data.to(self.device)
 
-                # 提取目标域特征
-                z_t = model.feature_extractor(data)  # 假设模型包含 feature_extractor 方法
+                z_t = model.feature_extractor(data)  
 
                 # 投影到子空间
                 z_proj = project_to_subspace(z_t, mu_s, V_s)
@@ -367,7 +376,7 @@ class FineTune(object):
                 ssa_loss = weighted_kl_loss(mu_t, sigma_t, lambdas, weights)
 
                 # 更新归一化层参数
-                optimizer.zero_grad()
+                
                 ssa_loss.backward()
                 optimizer.step()
 
@@ -389,7 +398,7 @@ class FineTune(object):
                 loss = self._step(model, data, 0)
                 test_loss += loss.item() * data.y.size(0)
                 num_data += data.y.size(0)
-
+                
                 # 分类任务归一化输出
                 if self.config['dataset']['task'] == 'classification':
                     pred = F.softmax(pred, dim=-1)
@@ -403,7 +412,16 @@ class FineTune(object):
                     labels.extend(data.y.cpu().flatten().numpy())
 
             test_loss /= num_data
-
+         # 定义保存的文件路径
+        csv_file_path = "predictions_labels.csv"
+                # 将数据写入 CSV 文件
+        with open(csv_file_path, mode='w', newline='') as file:
+            writer = csv.writer(file)
+            writer.writerow(["Prediction", "Label"])
+            for pred, label in zip(predictions, labels):
+                writer.writerow([pred, label])
+            print(f"数据已成功保存到 {csv_file_path}")
+        
         # 输出最终评估指标
         if self.config['dataset']['task'] == 'regression':
             predictions = np.array(predictions)
@@ -520,10 +538,10 @@ if __name__ == "__main__":
             'MUV-652', 'MUV-466', 'MUV-832'
         ]
 
-    elif config['task_name'] == 'FreeSolv':
+    elif config['task_name'] == 'FreeSolv': # 标记
         config['dataset']['task'] = 'regression'
         config['dataset']['data_path'] = 'data/freesolv/freesolv.csv'
-        target_list = ["expt"]
+        target_list = ["expt"] #  目标列
     
     elif config["task_name"] == 'ESOL':
         config['dataset']['task'] = 'regression'
