@@ -16,6 +16,9 @@ from sklearn.metrics import roc_auc_score, mean_squared_error, mean_absolute_err
 from dataset.dataset_test import MolTestDatasetWrapper
 
 
+from ssa import *
+
+
 apex_support = False
 try:
     sys.path.append('./apex')
@@ -112,6 +115,7 @@ class FineTune(object):
 
         if self.config['model_type'] == 'gin':
             from models.ginet_finetune import GINet
+            print("using GINet!")
             model = GINet(self.config['dataset']['task'], **self.config["model"]).to(self.device)
             model = self._load_pre_trained_weights(model)
         elif self.config['model_type'] == 'gcn':
@@ -186,8 +190,16 @@ class FineTune(object):
 
                 self.writer.add_scalar('validation_loss', valid_loss, global_step=valid_n_iter)
                 valid_n_iter += 1
+                
+        mu_s, V_s, lambdas = compute_source_statistics(train_loader,model,self.device,3)
         
-        self._test(model, test_loader)
+        # 2. 获取线性回归器权重 w
+        w = model.pred_head[0].weight.detach().cpu().numpy()  # 提取预测头第一层的权重
+        # 3. 计算加权因子 weights
+        weights = 1 + np.abs(np.dot(w, V_s.T))  # 计算投影并加权
+        
+        # self._test(model, test_loader)
+        self._test_with_ssa(model,test_loader,mu_s,V_s,lambdas,weights)
 
     def _load_pre_trained_weights(self, model):
         try:
@@ -309,6 +321,129 @@ class FineTune(object):
             labels = np.array(labels)
             self.roc_auc = roc_auc_score(labels, predictions[:,1])
             print('Test loss:', test_loss, 'Test ROC AUC:', self.roc_auc)
+    
+    def _test_with_ssa(self, model, test_loader, mu_s, V_s, lambdas, weights):        
+        
+        mu_s = torch.tensor(mu_s, device=self.device,dtype=torch.float32)
+        
+        V_s = torch.tensor(V_s, device=self.device,dtype=torch.float32)
+        
+        lambdas = torch.tensor(lambdas, device=self.device,dtype=torch.float32)
+        
+        weights = torch.tensor(weights, device=self.device,dtype=torch.float32)
+        
+        
+        # 加载最佳模型权重
+        model_path = os.path.join(self.writer.log_dir, 'checkpoints', 'model.pth')
+        state_dict = torch.load(model_path, map_location=self.device)
+        model.load_state_dict(state_dict)
+        print("Loaded trained model with success.")
+
+        # 初始化优化器，仅更新归一化层
+        for name, param in model.named_parameters():
+            if "batch_norm" in name:  # 定位归一化层
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
+        optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-3)
+
+        # SSA 阶段：适配目标域
+        model.train()  # 切换到训练模式
+        #################################epoch############
+        for epoch in range(50):  # 多轮轻量训练
+            for data in test_loader:
+                data = data.to(self.device)
+
+                # 提取目标域特征
+                z_t = model.feature_extractor(data)  # 假设模型包含 feature_extractor 方法
+
+                # 投影到子空间
+                z_proj = project_to_subspace(z_t, mu_s, V_s)
+
+                # 计算目标域统计量
+                mu_t, sigma_t = compute_statistics(z_proj)
+
+                # 计算特征对齐损失
+                ssa_loss = weighted_kl_loss(mu_t, sigma_t, lambdas, weights)
+
+                # 更新归一化层参数
+                optimizer.zero_grad()
+                ssa_loss.backward()
+                optimizer.step()
+
+        print("SSA adaptation completed.")
+
+        # 测试阶段：评估性能
+        model.eval()  # 切换到评估模式
+        predictions = []
+        labels = []
+        test_loss = 0.0
+        num_data = 0
+
+        with torch.no_grad():
+            for data in test_loader:
+                data = data.to(self.device)
+
+                # 前向推理
+                __, pred = model(data)
+                loss = self._step(model, data, 0)
+                test_loss += loss.item() * data.y.size(0)
+                num_data += data.y.size(0)
+
+                # 分类任务归一化输出
+                if self.config['dataset']['task'] == 'classification':
+                    pred = F.softmax(pred, dim=-1)
+
+                # 收集预测值和标签
+                if self.device == 'cpu':
+                    predictions.extend(pred.detach().numpy())
+                    labels.extend(data.y.flatten().numpy())
+                else:
+                    predictions.extend(pred.cpu().detach().numpy())
+                    labels.extend(data.y.cpu().flatten().numpy())
+
+            test_loss /= num_data
+
+        # 输出最终评估指标
+        if self.config['dataset']['task'] == 'regression':
+            predictions = np.array(predictions)
+            labels = np.array(labels)
+            if self.config['task_name'] in ['qm7', 'qm8', 'qm9']:
+                self.mae = mean_absolute_error(labels, predictions)
+                print('Test loss:', test_loss, 'Test MAE:', self.mae)
+            else:
+                self.rmse = mean_squared_error(labels, predictions, squared=False)
+                print('Test loss:', test_loss, 'Test RMSE:', self.rmse)
+
+        elif self.config['dataset']['task'] == 'classification': 
+            predictions = np.array(predictions)
+            labels = np.array(labels)
+            self.roc_auc = roc_auc_score(labels, predictions[:,1])
+            print('Test loss:', test_loss, 'Test ROC AUC:', self.roc_auc)
+
+    
+    def tmp(self,model):              
+        # 冻结非归一化层的参数
+        with open("output1.txt", "w") as f:
+            for name, param in model.named_parameters():
+                print(name,file=f)
+                if "batch_norms" in name:
+                    param.requires_grad = True  # 只更新批归一化层
+                else:
+                    param.requires_grad = False  # 冻结其他参数
+
+    # 仅优化归一化层参数
+    # optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-3)
+
+    # # 在目标域上优化
+    # model.train()  # 训练模式以更新均值和方差
+    # for batch in target_loader:
+    # x, edge_index, edge_attr = batch.x, batch.edge_index, batch.edge_attr
+    # h, pred = model(batch)  # 前向传播
+    # loss = loss_fn(pred, batch.y)  # 定义损失函数
+    # optimizer.zero_grad()
+    # loss.backward()
+    # optimizer.step()
 
 
 def main(config):

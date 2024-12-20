@@ -147,12 +147,42 @@ class GINet(nn.Module):
         
         return h, self.pred_head(h)
 
+    # 自定义，加载模型参数
     def load_my_state_dict(self, state_dict):
-        own_state = self.state_dict()
-        for name, param in state_dict.items():
-            if name not in own_state:
-                continue
-            if isinstance(param, nn.parameter.Parameter):
-                # backwards compatibility for serialized parameters
-                param = param.data
-            own_state[name].copy_(param)
+        with open("output.txt", "w") as f:
+            own_state = self.state_dict()
+        
+        # with open("output.txt", "w") as f:
+        #     print(own_state)
+        
+            for name, param in state_dict.items():
+                print(name,file=f)
+                if name not in own_state:
+                    continue
+                if isinstance(param, nn.parameter.Parameter):
+                    # backwards compatibility for serialized parameters
+                    param = param.data
+                own_state[name].copy_(param)
+        
+            # for name, param in own_state.items():
+            #     print(name,file=f)
+    def feature_extractor(self,data):
+        x = data.x
+        edge_index = data.edge_index
+        edge_attr = data.edge_attr
+        
+        h = self.x_embedding1(x[:,0]) + self.x_embedding2(x[:,1])
+
+        for layer in range(self.num_layer):
+            h = self.gnns[layer](h, edge_index, edge_attr)
+            h = self.batch_norms[layer](h)
+            if layer == self.num_layer - 1:
+                h = F.dropout(h, self.drop_ratio, training=self.training)
+            else:
+                h = F.dropout(F.relu(h), self.drop_ratio, training=self.training)
+
+        h = self.pool(h, data.batch)
+        h = self.feat_lin(h)
+        
+        return h
+            
